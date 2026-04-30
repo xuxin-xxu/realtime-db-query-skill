@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Schema Discovery for db-query skill.
+Schema Discovery for db-query skill (thin driver version).
 
 Fetches DDL, column info, and comments from Oracle/MySQL
 and writes them to skill/memory/schema_<alias>.md.
@@ -16,14 +16,8 @@ import time
 import re
 
 # scripts/ is at skills/db-query/scripts/
-# lib/ is at skills/db-query/lib/ (installed skill, not workspace)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_WORKSPACE_SKILL_DIR = os.path.dirname(_SCRIPT_DIR)  # .../workspace_mayu/skills/db-query
-_INSTALLED_SKILL_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(_WORKSPACE_SKILL_DIR))),
-    "skills", "db-query"
-)  # /home/ubuntu/.openclaw/skills/db-query
-SKILL_DIR = _INSTALLED_SKILL_DIR
+_WORKSPACE_SKILL_DIR = os.path.dirname(_SCRIPT_DIR)
 MEMORY_DIR = os.path.join(_WORKSPACE_SKILL_DIR, "memory")
 
 
@@ -52,86 +46,76 @@ def _to_markdown_table(headers: list, rows: list[list]) -> str:
     return "\n".join([header_line, sep_line] + data_lines)
 
 
-# ── Oracle Discovery ─────────────────────────────────────────────────────────
+def _parse_oracle_jdbc_url(jdbc_url: str) -> str:
+    """Parse Oracle JDBC URL and return dsn for oracledb thin driver."""
+    if not jdbc_url:
+        raise ValueError("jdbc_url is required for Oracle connection")
+    prefix = "jdbc:oracle:thin:@"
+    if jdbc_url.startswith(prefix):
+        return jdbc_url[len(prefix):]
+    return jdbc_url
 
-def _run_oracle_query(query_sql: str, conn: dict, max_retries: int = 2) -> list[dict]:
-    """Execute query using JayDeBeApi with Oracle wallet.
-    TCPS connections can take 30-60s due to SSL handshake; retries with longer timeout.
-    """
-    import jpype
-    import jaydebeapi
-    import socket
 
-    jar_dir = os.path.join(SKILL_DIR, "lib")
-    jars = [os.path.join(jar_dir, f) for f in os.listdir(jar_dir)
-            if f.endswith(".jar") and f.startswith(("ojdbc", "oraclepki", "osdt"))]
-
-    # Ensure JVM is started with correct classpath
-    for jar in jars:
-        if os.path.exists(jar):
-            jpype.addClassPath(jar)
-
-    if not jpype.isJVMStarted():
-        jpype.startJVM()
-
-    jdbc_driver = "oracle.jdbc.OracleDriver"
-    jdbc_url = conn["jdbc_url"]
-    wallet = conn.get("wallet_path")
-
-    jprops = jpype.java.util.Properties()
-    jprops.setProperty("user", conn["user"])
-    jprops.setProperty("password", conn["password"])
-    if wallet:
-        jprops.setProperty("oracle.net.tns_admin", wallet)
-        jprops.setProperty("oracle.net.wallet_location",
-                          f"(SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY={wallet})))")
-        jprops.setProperty("oracle.jdbc.ssl_server_dn_match", "true")
-
-    last_exc = None
-    for attempt in range(max_retries + 1):
+def _parse_mysql_jdbc_url(jdbc_url: str) -> dict:
+    """Parse MySQL JDBC URL and return params for mysql.connector."""
+    if not jdbc_url:
+        raise ValueError("jdbc_url is required for MySQL connection")
+    prefix = "jdbc:mysql://"
+    if jdbc_url.startswith(prefix):
+        rest = jdbc_url[len(prefix):]
+    else:
+        rest = jdbc_url
+    if "?" in rest:
+        rest = rest.split("?", 1)[0]
+    result = {"host": "localhost", "port": 3306, "database": None}
+    if "/" in rest:
+        hostport, db = rest.split("/", 1)
+        result["database"] = db
+    else:
+        hostport = rest
+    if ":" in hostport:
+        result["host"], port_str = hostport.split(":", 1)
         try:
-            conn_jdbc = jaydebeapi.connect(jdbc_driver, jdbc_url, [jprops])
-            try:
-                cur = conn_jdbc.cursor()
-                cur.execute(query_sql)
-                cols = [desc[0] for desc in cur.description]
-                rows = cur.fetchall()
-                return [dict(zip(cols, [_safe(v) for v in row])) for row in rows]
-            finally:
-                conn_jdbc.close()
-        except (socket.timeout, OSError, jpype.JavaException) as e:
-            last_exc = e
-            if attempt < max_retries:
-                import time
-                print(f"Query attempt {attempt+1} failed ({type(e).__name__}), retrying...", file=sys.stderr)
-                time.sleep(5)
-            continue
-
-    raise RuntimeError(f"Query failed after {max_retries+1} attempts: {last_exc}")
+            result["port"] = int(port_str)
+        except ValueError:
+            pass
+    else:
+        result["host"] = hostport
+    return result
 
 
-def _oracle_exec(conn: dict, query_sql: str, jdbc_conn):
-    """Execute a query using an existing JDBC connection (no new connection needed)."""
-    cur = jdbc_conn.cursor()
+def _oracle_exec(conn: dict, query_sql: str, oracledb_conn):
+    """Execute a query using an existing oracledb connection."""
+    cur = oracledb_conn.cursor()
     cur.execute(query_sql)
-    cols = [desc[0] for desc in cur.description]
+    cols = [_safe(desc[0]) for desc in cur.description]
     rows = cur.fetchall()
     return [dict(zip(cols, [_safe(v) for v in row])) for row in rows]
 
 
+def _mysql_exec(conn: dict, query_sql: str, mysql_conn):
+    """Execute a query using an existing mysql.connector connection."""
+    cur = mysql_conn.cursor()
+    cur.execute(query_sql)
+    cols = [_safe(desc[0]) for desc in cur.description]
+    rows = cur.fetchall()
+    return [dict(zip(cols, [_safe(v) for v in row])) for row in rows]
+
+
+# ── Oracle Discovery ─────────────────────────────────────────────────────────
+
 def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
     """
     Discover all table DDL + comments for an Oracle connection.
-    Uses a SINGLE JDBC connection for all queries to avoid repeated TCPS handshakes.
+    Uses a SINGLE oracledb connection for all queries.
     Writes to memory/schema_<alias>.md and returns the path.
-
-    timeout_sec: Overall timeout for the entire discovery process.
     """
-    import jpype
-    import jaydebeapi
+    import oracledb
 
     alias = conn["alias"]
     user = conn["user"]
+    password = conn["password"]
+    jdbc_url = conn["jdbc_url"]
     start_time = time.time()
 
     def elapsed():
@@ -141,32 +125,10 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
         if elapsed() > timeout_sec:
             raise TimeoutError(f"Schema discovery 超时（{timeout_sec}s），已停止。")
 
-    # ── Establish a SINGLE JDBC connection (reused for all queries) ──
-    jar_dir = os.path.join(SKILL_DIR, "lib")
-    jars = [os.path.join(jar_dir, f) for f in os.listdir(jar_dir)
-            if f.endswith(".jar") and f.startswith(("ojdbc", "oraclepki", "osdt"))]
-    for jar in jars:
-        if os.path.exists(jar):
-            jpype.addClassPath(jar)
+    dsn = _parse_oracle_jdbc_url(jdbc_url)
 
-    if not jpype.isJVMStarted():
-        jpype.startJVM()
-
-    jdbc_driver = "oracle.jdbc.OracleDriver"
-    jdbc_url = conn["jdbc_url"]
-    wallet = conn.get("wallet_path")
-
-    jprops = jpype.java.util.Properties()
-    jprops.setProperty("user", conn["user"])
-    jprops.setProperty("password", conn["password"])
-    if wallet:
-        jprops.setProperty("oracle.net.tns_admin", wallet)
-        jprops.setProperty("oracle.net.wallet_location",
-                          f"(SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY={wallet})))")
-        jprops.setProperty("oracle.jdbc.ssl_server_dn_match", "true")
-
-    print(f"[{elapsed():.1f}s] Establishing JDBC connection (TCPS, may take 30-60s)...", file=sys.stderr)
-    jdbc_conn = jaydebeapi.connect(jdbc_driver, jdbc_url, [jprops])
+    print(f"[{elapsed():.1f}s] Connecting to Oracle ({dsn})...", file=sys.stderr)
+    oracledb_conn = oracledb.connect(user=user, password=password, dsn=dsn)
     print(f"[{elapsed():.1f}s] Connected! Proceeding with metadata queries...", file=sys.stderr)
 
     try:
@@ -184,7 +146,7 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
         LEFT JOIN USER_TAB_COMMENTS c ON t.TABLE_NAME = c.TABLE_NAME
         ORDER BY t.NUM_ROWS DESC NULLS LAST
         """
-        tables = _oracle_exec(conn, tables_query, jdbc_conn)
+        tables = _oracle_exec(conn, tables_query, oracledb_conn)
         lines.append("## 表清单\n")
         lines.append("| 表名 | 行数 | 注释 |")
         lines.append("|------|------|------|")
@@ -214,7 +176,7 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
             WHERE c.TABLE_NAME = '{tbl}'
             ORDER BY c.COLUMN_ID
             """
-            cols = _oracle_exec(conn, col_query, jdbc_conn)
+            cols = _oracle_exec(conn, col_query, oracledb_conn)
             if not cols:
                 continue
 
@@ -261,10 +223,9 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
         WHERE cons.CONSTRAINT_TYPE = 'R'
         ORDER BY a.TABLE_NAME, a.POSITION
         """
-        fks = _oracle_exec(conn, fk_query, jdbc_conn)
+        fks = _oracle_exec(conn, fk_query, oracledb_conn)
 
-        # Build FK graph (for QueryOptimizer)
-        fk_graph = {}  # child_table -> {child_col: {parent_table, parent_col}}
+        fk_graph = {}
         if fks:
             for fk in fks:
                 child = fk["CHILD_TABLE"]
@@ -275,17 +236,6 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
                     fk_graph[child] = {}
                 fk_graph[child][child_col] = {"parent_table": parent, "parent_column": parent_col}
 
-        # Also build reverse index (parent -> list of children)
-        fk_graph_reversed = {}
-        for child, cols in fk_graph.items():
-            for child_col, parent_info in cols.items():
-                parent = parent_info["parent_table"]
-                if parent not in fk_graph_reversed:
-                    fk_graph_reversed[parent] = {}
-                fk_graph_reversed[parent][child] = {"on_column": child_col, "parent_column": parent_info["parent_column"]}
-
-        # Display FK table in markdown
-        if fks:
             lines.append("## 外键关系\n")
             lines.append("| 子表 | 子表字段 | 父表 | 父表字段 |")
             lines.append("|------|---------|------|---------|")
@@ -306,7 +256,7 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
         WHERE cons.CONSTRAINT_TYPE = 'P'
         ORDER BY c.TABLE_NAME, c.POSITION
         """
-        pks = _oracle_exec(conn, pk_query, jdbc_conn)
+        pks = _oracle_exec(conn, pk_query, oracledb_conn)
         if pks:
             lines.append("## 主键\n")
             lines.append("| 表名 | 字段 | 位置 |")
@@ -324,8 +274,7 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
                 lines.append(f"| {cur_tbl} | {', '.join(pk_cols)} | - |")
             lines.append("")
 
-        # ── 4. Build structured metadata (for QueryOptimizer) ──
-        # Build pk_map from pks
+        # ── Build structured metadata ──
         pk_map = {}
         if pks:
             for pk in pks:
@@ -334,12 +283,11 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
                     pk_map[t] = []
                 pk_map[t].append(pk["COLUMN_NAME"])
 
-        # Build tables_metadata from previous column queries
         tables_metadata = {}
         for t in tables:
             tbl = t["TABLE_NAME"]
             tables_metadata[tbl] = {
-                "columns": [],  # filled below
+                "columns": [],
                 "pk": pk_map.get(tbl, []),
             }
 
@@ -348,7 +296,7 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
         FROM USER_TAB_COLUMNS
         ORDER BY TABLE_NAME, COLUMN_ID
         """
-        all_cols = _oracle_exec(conn, col_meta_query, jdbc_conn)
+        all_cols = _oracle_exec(conn, col_meta_query, oracledb_conn)
         col_map = {}
         for row in all_cols:
             t = row["TABLE_NAME"]
@@ -358,7 +306,6 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
             if t in tables_metadata:
                 tables_metadata[t]["columns"] = col_map.get(t, [])
 
-        # JSON data block
         import json as _json
         schema_json = {
             "schema_name": alias,
@@ -386,38 +333,18 @@ def discover_oracle(conn: dict, timeout_sec: int = 300) -> str:
         return schema_file
 
     finally:
-        jdbc_conn.close()
+        oracledb_conn.close()
 
 
 # ── MySQL Discovery ─────────────────────────────────────────────────────────
-
-def _run_mysql_query(query_sql: str, conn: dict) -> list[dict]:
-    import jaydebeapi
-
-    jar_dir = os.path.join(SKILL_DIR, "lib")
-    jar_path = os.path.join(jar_dir, "mysql-connector-java.jar")
-    if not os.path.exists(jar_path):
-        raise RuntimeError(f"MySQL JDBC driver not found: {jar_path}")
-
-    jdbc_driver = "com.mysql.cj.jdbc.Driver"
-    jdbc_url = conn["jdbc_url"]
-
-    conn_jdbc = jaydebeapi.connect(jdbc_driver, jdbc_url, [], jar_path)
-    try:
-        cur = conn_jdbc.cursor()
-        cur.execute(query_sql)
-        cols = [desc[0] for desc in cur.description]
-        rows = cur.fetchall()
-        return [dict(zip(cols, [_safe(v) for v in row])) for row in rows]
-    finally:
-        conn_jdbc.close()
-
 
 def discover_mysql(conn: dict, timeout_sec: int = 60) -> str:
     """
     Discover all table DDL + comments for a MySQL connection.
     Writes to memory/schema_<alias>.md and returns the path.
     """
+    import mysql.connector
+
     alias = conn["alias"]
     start_time = time.time()
 
@@ -428,172 +355,190 @@ def discover_mysql(conn: dict, timeout_sec: int = 60) -> str:
         if elapsed() > timeout_sec:
             raise TimeoutError(f"Schema discovery 超时（{timeout_sec}s），已停止。")
 
-    db_name = conn.get("jdbc_url", "").split("/")[-1].split("?")[0]
-    lines = []
-    lines.append(f"# Schema: {alias} (MySQL)\n")
-    lines.append(f"**数据库:** `{db_name}`")
-    lines.append(f"**用户:** `{conn['user']}`")
-    lines.append(f"**发现时间:** `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n")
+    jdbc_url = conn["jdbc_url"]
+    params = _parse_mysql_jdbc_url(jdbc_url)
+    db_name = params.get("database")
 
-    # Table list
-    check_timeout()
-    print(f"[{elapsed():.1f}s] Fetching table list...", file=sys.stderr)
-    tables_query = f"""
-    SELECT TABLE_NAME, TABLE_ROWS, TABLE_COMMENT
-    FROM INFORMATION_SCHEMA.TABLES
-    WHERE TABLE_SCHEMA = '{db_name}'
-    ORDER BY TABLE_ROWS DESC
-    """
-    tables = _run_mysql_query(tables_query, conn)
-
-    lines.append("## 表清单\n")
-    lines.append("| 表名 | 行数(估) | 注释 |")
-    lines.append("|------|----------|------|")
-    for t in tables:
-        rows = t.get("TABLE_ROWS") or "?"
-        comment = _safe(t.get("TABLE_COMMENT", ""))
-        lines.append(f"| {t['TABLE_NAME']} | {rows} | {comment} |")
-    lines.append("")
-
-    # Column details
-    check_timeout()
-    print(f"[{elapsed():.1f}s] Fetching column details...", file=sys.stderr)
-    lines.append("## 表结构详情\n")
-
-    for i, t in enumerate(tables):
-        check_timeout()
-        tbl = t["TABLE_NAME"]
-        print(f"[{elapsed():.1f}s]  [{i+1}/{len(tables)}] Processing {tbl}...", file=sys.stderr)
-
-        col_query = f"""
-        SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
-               NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_KEY,
-               COLUMN_COMMENT
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{tbl}'
-        ORDER BY ORDINAL_POSITION
-        """
-        cols = _run_mysql_query(col_query, conn)
-        if not cols:
-            continue
-
-        table_comment = _safe(t.get("TABLE_COMMENT", ""))
-        lines.append(f"### {tbl}")
-        if table_comment:
-            lines.append(f"**注释:** {table_comment}")
-        lines.append("")
-        lines.append("| 字段名 | 类型 | 可空 | 主键 | 注释 |")
-        lines.append("|--------|------|------|------|------|")
-        for c in cols:
-            dtype = _safe(c.get("DATA_TYPE", ""))
-            charmax = c.get("CHARACTER_MAXIMUM_LENGTH")
-            numprec = c.get("NUMERIC_PRECISION")
-            numscale = c.get("NUMERIC_SCALE")
-            nullable = "N" if _safe(c.get("IS_NULLABLE", "")) == "NO" else "Y"
-            pk = "PK" if _safe(c.get("COLUMN_KEY", "")) == "PRI" else ""
-            comment = _safe(c.get("COLUMN_COMMENT", ""))
-
-            if charmax:
-                dtype_full = f"{dtype}({charmax})"
-            elif numprec:
-                dtype_full = f"{dtype}({numprec}"
-                if numscale:
-                    dtype_full += f",{numscale}"
-                dtype_full += ")"
-            else:
-                dtype_full = dtype
-
-            lines.append(f"| {c['COLUMN_NAME']} | {dtype_full} | {nullable} | {pk} | {comment} |")
-        lines.append("")
-
-    # ── FK discovery (MySQL) ──
-    check_timeout()
-    print(f"[{elapsed():.1f}s] Fetching foreign keys...", file=sys.stderr)
-    fk_query = f"""
-    SELECT TABLE_NAME AS CHILD_TABLE, COLUMN_NAME AS CHILD_COLUMN,
-           REFERENCED_TABLE_NAME AS PARENT_TABLE,
-           REFERENCED_COLUMN_NAME AS PARENT_COLUMN
-    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-    WHERE TABLE_SCHEMA = '{db_name}'
-      AND REFERENCED_TABLE_NAME IS NOT NULL
-    ORDER BY TABLE_NAME
-    """
-    fks = _run_mysql_query(fk_query, conn)
-
-    fk_graph = {}
-    if fks:
-        for fk in fks:
-            child = fk["CHILD_TABLE"]
-            child_col = fk["CHILD_COLUMN"]
-            parent = fk["PARENT_TABLE"]
-            parent_col = fk["PARENT_COLUMN"]
-            if child not in fk_graph:
-                fk_graph[child] = {}
-            fk_graph[child][child_col] = {"parent_table": parent, "parent_column": parent_col}
-
-        lines.append("## 外键关系\n")
-        lines.append("| 子表 | 子表字段 | 父表 | 父表字段 |")
-        lines.append("|------|---------|------|---------|")
-        for fk in fks:
-            lines.append(
-                f"| {fk['CHILD_TABLE']} | {fk['CHILD_COLUMN']} | "
-                f"{fk['PARENT_TABLE']} | {fk['PARENT_COLUMN']} |"
-            )
-        lines.append("")
-
-    # ── Build structured metadata (for QueryOptimizer) ──
-    tables_metadata = {}
-    for t in tables:
-        tbl = t["TABLE_NAME"]
-        tables_metadata[tbl] = {"columns": [], "pk": []}
-
-    col_meta_query = f"""
-    SELECT TABLE_NAME, COLUMN_NAME, COLUMN_KEY
-    FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_SCHEMA = '{db_name}'
-    ORDER BY TABLE_NAME, ORDINAL_POSITION
-    """
-    all_cols = _run_mysql_query(col_meta_query, conn)
-    col_map = {}
-    pk_map = {}
-    for row in all_cols:
-        t = row["TABLE_NAME"]
-        if t not in col_map:
-            col_map[t] = []
-        col_map[t].append(row["COLUMN_NAME"])
-        if row.get("COLUMN_KEY") == "PRI":
-            if t not in pk_map:
-                pk_map[t] = []
-            pk_map[t].append(row["COLUMN_NAME"])
-        if t in tables_metadata:
-            tables_metadata[t]["columns"] = col_map.get(t, [])
-            tables_metadata[t]["pk"] = pk_map.get(t, [])
-
-    # JSON data block
-    import json as _json
-    schema_json = {
-        "schema_name": alias,
-        "db_type": "mysql",
-        "tables": tables_metadata,
-        "fk_graph": fk_graph,
-        "discovered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    config = {
+        "host": params["host"],
+        "port": params["port"],
+        "user": conn["user"],
+        "password": conn["password"],
+        "database": db_name,
     }
 
-    lines.append("")
-    lines.append("<!--")
-    lines.append("```json")
-    lines.append(_json.dumps(schema_json, ensure_ascii=False, indent=2))
-    lines.append("```")
-    lines.append("-->")
+    print(f"[{elapsed():.1f}s] Connecting to MySQL ({params['host']}:{params['port']}/{db_name})...", file=sys.stderr)
+    mysql_conn = mysql.connector.connect(**config)
+    print(f"[{elapsed():.1f}s] Connected!", file=sys.stderr)
 
-    schema_file = os.path.join(MEMORY_DIR, f"schema_{alias.replace(' ', '_').replace('/', '_')}.md")
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    with open(schema_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    try:
+        lines = []
+        lines.append(f"# Schema: {alias} (MySQL)\n")
+        lines.append(f"**数据库:** `{db_name}`")
+        lines.append(f"**用户:** `{conn['user']}`")
+        lines.append(f"**发现时间:** `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n")
 
-    elapsed = time.time() - start_time
-    print(f"[{elapsed:.1f}s] Done! Schema written to {schema_file}", file=sys.stderr)
-    return schema_file
+        # Table list
+        check_timeout()
+        print(f"[{elapsed():.1f}s] Fetching table list...", file=sys.stderr)
+        tables_query = f"""
+        SELECT TABLE_NAME, TABLE_ROWS, TABLE_COMMENT
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = '{db_name}'
+        ORDER BY TABLE_ROWS DESC
+        """
+        tables = _mysql_exec(conn, tables_query, mysql_conn)
+
+        lines.append("## 表清单\n")
+        lines.append("| 表名 | 行数(估) | 注释 |")
+        lines.append("|------|----------|------|")
+        for t in tables:
+            rows = t.get("TABLE_ROWS") or "?"
+            comment = _safe(t.get("TABLE_COMMENT", ""))
+            lines.append(f"| {t['TABLE_NAME']} | {rows} | {comment} |")
+        lines.append("")
+
+        # Column details
+        check_timeout()
+        print(f"[{elapsed():.1f}s] Fetching column details...", file=sys.stderr)
+        lines.append("## 表结构详情\n")
+
+        for i, t in enumerate(tables):
+            check_timeout()
+            tbl = t["TABLE_NAME"]
+            print(f"[{elapsed():.1f}s]  [{i+1}/{len(tables)}] Processing {tbl}...", file=sys.stderr)
+
+            col_query = f"""
+            SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+                   NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_KEY,
+                   COLUMN_COMMENT
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{tbl}'
+            ORDER BY ORDINAL_POSITION
+            """
+            cols = _mysql_exec(conn, col_query, mysql_conn)
+            if not cols:
+                continue
+
+            table_comment = _safe(t.get("TABLE_COMMENT", ""))
+            lines.append(f"### {tbl}")
+            if table_comment:
+                lines.append(f"**注释:** {table_comment}")
+            lines.append("")
+            lines.append("| 字段名 | 类型 | 可空 | 主键 | 注释 |")
+            lines.append("|--------|------|------|------|------|")
+            for c in cols:
+                dtype = _safe(c.get("DATA_TYPE", ""))
+                charmax = c.get("CHARACTER_MAXIMUM_LENGTH")
+                numprec = c.get("NUMERIC_PRECISION")
+                numscale = c.get("NUMERIC_SCALE")
+                nullable = "N" if _safe(c.get("IS_NULLABLE", "")) == "NO" else "Y"
+                pk = "PK" if _safe(c.get("COLUMN_KEY", "")) == "PRI" else ""
+                comment = _safe(c.get("COLUMN_COMMENT", ""))
+
+                if charmax:
+                    dtype_full = f"{dtype}({charmax})"
+                elif numprec:
+                    dtype_full = f"{dtype}({numprec}"
+                    if numscale:
+                        dtype_full += f",{numscale}"
+                    dtype_full += ")"
+                else:
+                    dtype_full = dtype
+
+                lines.append(f"| {c['COLUMN_NAME']} | {dtype_full} | {nullable} | {pk} | {comment} |")
+            lines.append("")
+
+        # ── FK discovery (MySQL) ──
+        check_timeout()
+        print(f"[{elapsed():.1f}s] Fetching foreign keys...", file=sys.stderr)
+        fk_query = f"""
+        SELECT TABLE_NAME AS CHILD_TABLE, COLUMN_NAME AS CHILD_COLUMN,
+               REFERENCED_TABLE_NAME AS PARENT_TABLE,
+               REFERENCED_COLUMN_NAME AS PARENT_COLUMN
+        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = '{db_name}'
+          AND REFERENCED_TABLE_NAME IS NOT NULL
+        ORDER BY TABLE_NAME
+        """
+        fks = _mysql_exec(conn, fk_query, mysql_conn)
+
+        fk_graph = {}
+        if fks:
+            for fk in fks:
+                child = fk["CHILD_TABLE"]
+                child_col = fk["CHILD_COLUMN"]
+                parent = fk["PARENT_TABLE"]
+                parent_col = fk["PARENT_COLUMN"]
+                if child not in fk_graph:
+                    fk_graph[child] = {}
+                fk_graph[child][child_col] = {"parent_table": parent, "parent_column": parent_col}
+
+            lines.append("## 外键关系\n")
+            lines.append("| 子表 | 子表字段 | 父表 | 父表字段 |")
+            lines.append("|------|---------|------|---------|")
+            for fk in fks:
+                lines.append(
+                    f"| {fk['CHILD_TABLE']} | {fk['CHILD_COLUMN']} | "
+                    f"{fk['PARENT_TABLE']} | {fk['PARENT_COLUMN']} |"
+                )
+            lines.append("")
+
+        # ── Build structured metadata ──
+        tables_metadata = {}
+        for t in tables:
+            tbl = t["TABLE_NAME"]
+            tables_metadata[tbl] = {"columns": [], "pk": []}
+
+        col_meta_query = f"""
+        SELECT TABLE_NAME, COLUMN_NAME, COLUMN_KEY
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{db_name}'
+        ORDER BY TABLE_NAME, ORDINAL_POSITION
+        """
+        all_cols = _mysql_exec(conn, col_meta_query, mysql_conn)
+        col_map = {}
+        pk_map = {}
+        for row in all_cols:
+            t = row["TABLE_NAME"]
+            if t not in col_map:
+                col_map[t] = []
+            col_map[t].append(row["COLUMN_NAME"])
+            if row.get("COLUMN_KEY") == "PRI":
+                if t not in pk_map:
+                    pk_map[t] = []
+                pk_map[t].append(row["COLUMN_NAME"])
+            if t in tables_metadata:
+                tables_metadata[t]["columns"] = col_map.get(t, [])
+                tables_metadata[t]["pk"] = pk_map.get(t, [])
+
+        import json as _json
+        schema_json = {
+            "schema_name": alias,
+            "db_type": "mysql",
+            "tables": tables_metadata,
+            "fk_graph": fk_graph,
+            "discovered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        lines.append("")
+        lines.append("<!--")
+        lines.append("```json")
+        lines.append(_json.dumps(schema_json, ensure_ascii=False, indent=2))
+        lines.append("```")
+        lines.append("-->")
+
+        schema_file = os.path.join(MEMORY_DIR, f"schema_{alias.replace(' ', '_').replace('/', '_')}.md")
+        os.makedirs(MEMORY_DIR, exist_ok=True)
+        with open(schema_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        elapsed = time.time() - start_time
+        print(f"[{elapsed:.1f}s] Done! Schema written to {schema_file}", file=sys.stderr)
+        return schema_file
+
+    finally:
+        mysql_conn.close()
 
 
 if __name__ == "__main__":

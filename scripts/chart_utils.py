@@ -390,3 +390,21 @@ def render_line_chart(
 
 
     return out
+
+
+# ── 飞书图片发送快捷入口 ──────────────────────────────────
+
+def send_charts_to_feishu(image_paths: list, target: str, is_message_id: bool = True, app_id: str = None, app_secret: str = None):
+    """
+    渲染结束后，将图片直接发送到飞书聊天窗口。
+
+    Args:
+        image_paths: 图片文件路径列表
+        target: 消息 ID（reply）或会话 ID（send to chat）
+        is_message_id: True=回复消息, False=发送到会话
+        app_id: 飞书 App ID（默认从 openclaw.json 读取）
+        app_secret: 飞书 App Secret（默认从 openclaw.json 读取）
+    """
+    from .feishu_uploader import FeishuUploader
+    uploader = FeishuUploader(app_id=app_id, app_secret=app_secret)
+    uploader.upload_batch(image_paths, target, is_message_id)

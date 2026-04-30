@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Connection Manager for db-query skill — v1.0.1.
+Connection Manager for db-query skill — v2.0 (thin driver).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ⚠️  IMPORTANT: This version is designed for clawhub publishing.
   All connection credentials are stored EXCLUSIVELY in openclaw.json
   skills.env — NO secrets on disk.
+  Uses Python thin drivers (oracledb / mysql-connector-python) — no Java/JDBC.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Connection storage (Single Source of Truth: openclaw.json):
 ───────────────────────────────────────────────────────────────
   CONN_<alias_key>  →  JSON string with full connection config
 
+  The `jdbc_url` field is still used for compatibility with existing configs.
+  Internally, the thin driver parser strips the JDBC prefix
+  (e.g., "jdbc:oracle:thin:@" or "jdbc:mysql://") and uses the remainder
+  as the native DSN/connection string.
+
   Example:
     CONN____  =  '{"db_type":"oracle","user":"wksp_xuxin","password":"xxx",
-                    "jdbc_url":"jdbc:oracle:thin:@(description=...)",
+                    "jdbc_url":"jdbc:oracle:thin:@host:port/service",
                     "wallet_path":"/home/ubuntu/adbwallet"}'
 
   Alias → env-key rules:
@@ -47,6 +53,7 @@ Security guarantees:
   ✅ Alias → env-key mapping is deterministic (no ambiguity)
   ✅ list_connections() strips passwords before returning
   ✅ get_active() reads ONLY from environment variables
+  ✅ No Java/JDK/JDBC JARs needed — native Python thin drivers only
 """
 
 import json
@@ -439,7 +446,7 @@ def diagnose() -> str:
     active = get_active()
 
     lines = [
-        "═══ db-query 连接诊断 (v1.0.1) ═══",
+        "═══ db-query 连接诊断 (v2.0 thin driver) ═══",
         "",
         f"📦 openclaw.json CONN_* 环境变量: {len(env_conns)} 个连接",
         f"💾 connections.json (fallback):  {len(disk_conns)} 个连接",
@@ -467,15 +474,16 @@ def diagnose() -> str:
 
     lines.append("")
     lines.append("📝 下一步:")
-    lines.append("   1. 确认 openclaw.json 已添加 CONN_* 配置")
-    lines.append("   2. 重启 openclaw 网关: openclaw gateway restart")
-    lines.append("   3. 运行 diagnose() 确认检测到连接")
+    lines.append("   1. 确认 thin driver 依赖已安装: pip install -r requirements.txt")
+    lines.append("   2. 确认 openclaw.json 已添加 CONN_* 配置")
+    lines.append("   3. 重启 openclaw 网关: openclaw gateway restart")
+    lines.append("   4. 运行 diagnose() 确认检测到连接")
 
     return "\n".join(lines)
 
 
 if __name__ == "__main__":
-    print("=== db-query 连接管理 (v1.0.1) ===")
+    print("=== db-query 连接管理 (v2.0 thin driver) ===")
     print()
     print(f"CONN_* env vars : {len(_load_from_env())} 个连接")
     print(f"connections.json: {len(_load_from_disk())} 个连接（fallback）")

@@ -1,32 +1,16 @@
 #!/usr/bin/env python3
 """
-Unified Database Query Script for db-query 1.1.
-Supports Oracle ADB (TCPS/Wallet) and MySQL connections natively.
+Unified Database Query Script for db-query (thin driver version).
+Supports Oracle and MySQL connections via native Python thin drivers.
 """
 
 import sys
 import os
 import re
 
-# Determine paths: scripts live in workspace, lib lives in installed skill
+# Determine paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE_SKILL_DIR = os.path.dirname(SCRIPT_DIR)  # workspace_mayu/skills/db-query
-INSTALLED_SKILL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(WORKSPACE_SKILL_DIR))), "skills", "db-query")
-LIB_DIR = os.path.join(INSTALLED_SKILL_DIR, "lib")
-WALLET_PATH = os.environ.get("TNS_ADMIN", "/home/ubuntu/adbwallet")
 
-ORACLE_DEFAULT_DSN = "(description=(address=(protocol=tcps)(port=1522)(host=adb.ca-toronto-1.oraclecloud.com))(connect_data=(service_name=gdc4bbe84a839b8_xxuclawdb_high.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))"
-
-ORACLE_REQUIRED_JARS = [
-    "ojdbc11.jar",       # JDBC driver (Java 21 compatible)
-    "oraclepki.jar",      # Oracle PKI for wallet operations
-    "osdt_core.jar",      # Oracle security core
-    "osdt_cert.jar",      # Oracle security cert
-]
-
-MYSQL_REQUIRED_JARS = [
-    "mysql-connector-java.jar"
-]
 
 def _guard_read_only(query_str: str):
     """Reject any non-SELECT SQL to enforce read-only access."""
@@ -37,120 +21,137 @@ def _guard_read_only(query_str: str):
         if re.match(rf'\b{kw}\b', cleaned):
             raise PermissionError(f"Only SELECT queries allowed. Blocked key phrase: {kw}")
 
-def _find_jars(jar_list: list[str]) -> list[str]:
-    """Find required JARs in lib directory. Raise Agent-tailored error if missing."""
-    found = []
-    missing = []
-    for jar in jar_list:
-        path = os.path.join(LIB_DIR, jar)
-        if os.path.exists(path):
-            found.append(path)
-        else:
-            missing.append(jar)
-    if missing:
-        raise RuntimeError(
-            f"缺少必需的 JDBC 组件: {', '.join(missing)}。 请对用户说：'查询需要本地依赖支持，请问您允许我自动下载缺失的 JDBC 驱动，还是您稍后自己手动解决？' 如果用户同意自动下载，请您在后台替用户运行终端命令：\n"
-            f"python install.py --auto-jdbc"
-        )
-    return found
 
-def _check_jvm_before_start():
-    import subprocess
-    try:
-        res = subprocess.run(["java", "-version"], capture_output=True, text=True, check=True)
-        output = res.stderr if res.stderr else res.stdout
-        match = re.search(r'version "(\d+)\.', output)
-        if match and int(match.group(1)) >= 18:
-            return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
+def _parse_oracle_jdbc_url(jdbc_url: str) -> str:
+    """
+    Parse Oracle JDBC URL and return dsn for oracledb thin driver.
 
-    raise RuntimeError(
-        "检测到本机未提供 Java(>=18) 生产环境，无法驱动查询组件。请立刻对用户说：'系统尚未安装符合要求的 Java 依赖库。请问您允许我立刻使用底层沙盒为您全自动下载安装，还是您希望稍后自己手动处理？' 如果用户指示同意自动安装，请您在后台替用户执行终端指令：\n"
-        "python install.py --auto-java"
-    )
+    Input:  jdbc:oracle:thin:@host:port/service
+    Output: host:port/service
 
-def _build_oracle_jdbc_url(user: str, password: str, dsn: str = None) -> str:
-    """Build Oracle JDBC thin URL with TCPS descriptor."""
-    # If the user's connection already provided a full JDBC URL starting with jdbc:, use it
-    if dsn and dsn.startswith("jdbc:oracle:"):
-        return dsn
-    if dsn:
-        return f"jdbc:oracle:thin:@{dsn}"
-    return f"jdbc:oracle:thin:@{ORACLE_DEFAULT_DSN}"
+    Also handles full descriptor format: jdbc:oracle:thin:@(description=...)
+    """
+    if not jdbc_url:
+        raise ValueError("jdbc_url is required for Oracle connection")
 
-def _get_oracle_jdbc_properties(user: str, password: str, wallet: str = None) -> dict:
-    """Build Java Properties for Oracle JDBC connection."""
-    w = wallet or WALLET_PATH
-    return {
-        "user": user,
-        "password": password,
-        "oracle.net.tns_admin": w,
-        "oracle.net.wallet_location": f"(SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY={w})))",
-        "oracle.jdbc.ssl_server_dn_match": "true",
-    }
+    # Strip jdbc:oracle:thin:@ prefix
+    prefix = "jdbc:oracle:thin:@"
+    if jdbc_url.startswith(prefix):
+        dsn = jdbc_url[len(prefix):]
+    else:
+        # Maybe it's already a plain dsn
+        dsn = jdbc_url
+
+    return dsn
+
+
+def _parse_mysql_jdbc_url(jdbc_url: str) -> dict:
+    """
+    Parse MySQL JDBC URL and return params for mysql.connector.
+
+    Input:  jdbc:mysql://host:port/db?params
+    Output: {host, port, database, (optional query params)}
+    """
+    if not jdbc_url:
+        raise ValueError("jdbc_url is required for MySQL connection")
+
+    prefix = "jdbc:mysql://"
+    if jdbc_url.startswith(prefix):
+        rest = jdbc_url[len(prefix):]
+    else:
+        rest = jdbc_url
+
+    # Split off query parameters
+    query_params = {}
+    if "?" in rest:
+        rest, qs = rest.split("?", 1)
+        for pair in qs.split("&"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                query_params[k] = v
+
+    # Parse host:port/database
+    result = {"host": "localhost", "port": 3306, "database": None}
+    if "/" in rest:
+        hostport, db = rest.split("/", 1)
+        result["database"] = db
+    else:
+        hostport = rest
+
+    if ":" in hostport:
+        result["host"], port_str = hostport.split(":", 1)
+        try:
+            result["port"] = int(port_str)
+        except ValueError:
+            pass
+    else:
+        result["host"] = hostport
+
+    result.update(query_params)
+    return result
+
 
 def _query_oracle(query_str: str, conn_info: dict) -> list[dict]:
-    import jpype
-    import jaydebeapi
-
-    jars = _find_jars(ORACLE_REQUIRED_JARS)
-    _check_jvm_before_start()
-    
-    for jar in jars:
-        if os.path.exists(jar):
-            jpype.addClassPath(jar)
-    if not jpype.isJVMStarted():
-        jpype.startJVM()
+    """Query Oracle using oracledb thin driver (no JDBC)."""
+    import oracledb
 
     user = conn_info.get("user", "")
     password = conn_info.get("password", "")
-    dsn = conn_info.get("jdbc_url")
-    wallet = conn_info.get("wallet_path")
+    jdbc_url = conn_info.get("jdbc_url", "")
 
-    jdbc_driver = "oracle.jdbc.OracleDriver"
-    jdbc_url = _build_oracle_jdbc_url(user, password, dsn)
+    dsn = _parse_oracle_jdbc_url(jdbc_url)
 
-    jdbc_props = _get_oracle_jdbc_properties(user, password, wallet)
-    jprops = jpype.java.util.Properties()
-    for k, v in jdbc_props.items():
-        jprops.setProperty(k, v)
-
-    conn = jaydebeapi.connect(jdbc_driver, jdbc_url, [jprops])
     try:
-        cur = conn.cursor()
+        connection = oracledb.connect(user=user, password=password, dsn=dsn)
+    except oracledb.Error as e:
+        raise RuntimeError(f"Oracle connection failed: {e}")
+
+    try:
+        cur = connection.cursor()
         cur.execute(query_str)
         cols = [_py_str(desc[0]) for desc in cur.description]
         rows = cur.fetchall()
         return [dict(zip(cols, [_py_str(v) for v in row])) for row in rows]
     finally:
-        conn.close()
+        connection.close()
+
 
 def _query_mysql(query_str: str, conn_info: dict) -> list[dict]:
-    import jaydebeapi
+    """Query MySQL using mysql.connector (no JDBC)."""
+    import mysql.connector
 
-    jars = _find_jars(MYSQL_REQUIRED_JARS)
-    _check_jvm_before_start()
-    jar_path = jars[0]
-
-    jdbc_driver = "com.mysql.cj.jdbc.Driver"
-    jdbc_url = conn_info.get("jdbc_url", "")
     user = conn_info.get("user", "")
     password = conn_info.get("password", "")
+    jdbc_url = conn_info.get("jdbc_url", "")
 
-    conn = jaydebeapi.connect(jdbc_driver, jdbc_url, [user, password], jar_path)
+    params = _parse_mysql_jdbc_url(jdbc_url)
+
+    config = {
+        "host": params["host"],
+        "port": params["port"],
+        "user": user,
+        "password": password,
+        "database": params.get("database"),
+    }
+
     try:
-        cur = conn.cursor()
+        connection = mysql.connector.connect(**config)
+    except mysql.connector.Error as e:
+        raise RuntimeError(f"MySQL connection failed: {e}")
+
+    try:
+        cur = connection.cursor()
         cur.execute(query_str)
         cols = [_py_str(desc[0]) for desc in cur.description]
         rows = cur.fetchall()
         return [dict(zip(cols, [_py_str(v) for v in row])) for row in rows]
     finally:
-        conn.close()
+        connection.close()
+
 
 def query(query_str: str, alias: str = None) -> list[dict]:
     """
-    Execute SELECT query via JDBC (MySQL or Oracle).
+    Execute SELECT query via Python thin driver (MySQL or Oracle).
 
     Args:
         query_str: SQL SELECT statement
@@ -183,7 +184,7 @@ def query(query_str: str, alias: str = None) -> list[dict]:
         )
 
     db_type = conn_info.get("db_type", "").lower()
-    
+
     if db_type == "oracle":
         return _query_oracle(query_str, conn_info)
     elif db_type == "mysql":
@@ -191,12 +192,14 @@ def query(query_str: str, alias: str = None) -> list[dict]:
     else:
         raise ValueError(f"Unknown or missing db_type: {db_type}")
 
+
 def _py_str(val):
     if val is None:
         return None
     if hasattr(val, '__str__'):
         return str(val)
     return val
+
 
 def format_results(rows: list[dict], max_rows: int = 100) -> str:
     """Format query results as readable markdown table."""
@@ -212,7 +215,6 @@ def format_results(rows: list[dict], max_rows: int = 100) -> str:
         footer = ""
 
     headers = list(rows[0].keys())
-    # Ensure keys are strings for max length calculation
     str_headers = [str(h) for h in headers]
     col_widths = {str(h): max(len(str(h)), max(len(str(r.get(h, ''))) for r in rows)) for h in headers}
 
@@ -223,6 +225,7 @@ def format_results(rows: list[dict], max_rows: int = 100) -> str:
         data_lines.append("| " + " | ".join(str(row.get(h, '')).ljust(col_widths[str(h)]) for h in headers) + " |")
 
     return "\n".join([header_line, sep_line] + data_lines) + footer
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

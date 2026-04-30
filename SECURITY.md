@@ -1,6 +1,6 @@
-# SECURITY.md — db-query 安全设计说明 (v1.1.0)
+# SECURITY.md — db-query 安全设计说明 (v2.0 thin driver)
 
-> 本文件详细说明 v1.1.0 的安全架构设计。
+> 本文件详细说明 v2.0 的安全架构设计。
 > **所有用户必须阅读此文件。**
 
 ---
@@ -15,7 +15,7 @@ subprocess.run(["sudo", "apt-get", "install", "-y", "fonts-noto-cjk", "-q"])
 ```
 攻击者通过 Agent prompt injection 可在目标机器执行任意系统命令。
 
-**v1.1 修复 — 三级降级，用户级双轨安装（无 sudo）：**
+**v2.0 修复 — 三级降级，用户级双轨安装（无 sudo）：**
 ```
 1. 检查系统字体  /usr/share/fonts/opentype/noto/NotoSansCJK-*.ttc
 2. 检查用户目录  ~/.local/share/fonts/
@@ -26,7 +26,7 @@ subprocess.run(["sudo", "apt-get", "install", "-y", "fonts-noto-cjk", "-q"])
 
 **验证：**
 ```bash
-grep -rn "sudo\|apt-get" skills/db-query-1.0.1/
+grep -rn "sudo\|apt-get" skills/db-query/
 # 返回空
 ```
 
@@ -41,7 +41,7 @@ grep -rn "sudo\|apt-get" skills/db-query-1.0.1/
 ```
 机器被入侵 → 攻击者直接拿到所有数据库密码。
 
-**v1.1 架构延续 — Zero-Disk Credential 机制：**
+**v2.0 架构延续 — Zero-Disk Credential 机制：**
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -50,8 +50,7 @@ grep -rn "sudo\|apt-get" skills/db-query-1.0.1/
 │  skills.env:                                            │
 │    CONN____  = '{"db_type":"oracle","user":"wksp_xuxin", │
 │                  "password":"Jessica820608",             │
-│                  "jdbc_url":"jdbc:oracle:thin:@...",    │
-│                  "wallet_path":"/home/ubuntu/adbwallet"}'│
+│                  "jdbc_url":"jdbc:oracle:thin:@..."}'    │
 │                                                         │
 │    CONN_PROD_MYSQL = '{"db_type":"mysql","user":"root", │
 │                        "password":"xxx",                │
@@ -66,7 +65,7 @@ grep -rn "sudo\|apt-get" skills/db-query-1.0.1/
               │  (仅存在于进程内存)           │
               └────────────────────────────┘
                            │
-                           │ JDBC connect
+                           │ thin driver connect
                            ▼
               ┌────────────────────────────┐
               │      Oracle / MySQL         │
@@ -96,56 +95,40 @@ disk: 无任何密码落地
 
 ---
 
-## 🛠 从 v1.0.0 升级步骤
+## 🛠 从 v1.x 升级步骤
 
-### Step 1: 确认当前 openclaw.json 无 CONN_* 配置
-
-```python
-from connection_manager import diagnose
-print(diagnose())
-```
-
-### Step 2: 添加所有连接
-
-对每个旧连接（从 `connections.json` 读取），重新调用 `add_connection()` 并将输出的 JSON 添加到 `openclaw.json`：
-
-```python
-from connection_manager import add_connection
-
-# 示例
-add_connection(
-    alias="生产库",
-    db_type="oracle",
-    user="wksp_xuxin",
-    password="Jessica820608",
-    jdbc_url="jdbc:oracle:thin:@(description=...)",
-    wallet_path="/home/ubuntu/adbwallet",
-)
-# → 输出需要在 openclaw.json 中添加的 CONN____ 配置
-```
-
-### Step 3: 确认 connections.json 中无 password
-
-```python
-from connection_manager import _load_from_disk
-for c in _load_from_disk():
-    print(f"{c.get('alias')}: {'⚠️ 有密码' if c.get('password') else '✅ 无密码'}")
-```
-
-如果有密码残留，手动从 connections.json 删除 `"password"` 字段。
-
-### Step 4: 重启网关
+### Step 1: 安装 thin driver 依赖
 
 ```bash
-openclaw gateway restart
+cd ~/.openclaw/skills-ins/db-query
+python install.py --auto-pip
+# 或
+pip install -r requirements.txt
 ```
 
-### Step 5: 验证
+### Step 2: 确认当前配置兼容
+
+现有配置中的 `jdbc_url` 字段仍然兼容，thin driver 会自动解析：
+- Oracle `jdbc:oracle:thin:@host:port/service` → 提取 DSN
+- MySQL `jdbc:mysql://host:port/db` → 提取 host/port/db
+
+### Step 3: 可选清理
+
+```bash
+# 旧版 JAR 文件不再需要，可以安全删除
+rm -rf ~/.openclaw/skills-ins/db-query/lib/
+```
+
+### Step 4: 验证
 
 ```python
 from connection_manager import diagnose, get_active
 print(diagnose())
 print("当前活跃:", get_active()["alias"])
+
+from db_query import query
+rows = query("SELECT 1 FROM DUAL")
+print(rows)  # 应返回 [{"1": 1}]
 ```
 
 ---
@@ -158,9 +141,6 @@ print("当前活跃:", get_active()["alias"])
 | `memory/connections.json` | 仅连接别名（无密码） | 0600 | 🟡 中 |
 | `memory/schema_*.md` | 表结构元数据 | 0644 | 🟢 低 |
 | `~/.local/share/fonts/` | CJK 字体文件 | 0700 | 🟢 低 |
-| `lib/*.jar` | JDBC 驱动 | 0644 | 🟢 低 |
-
-**Oracle Wallet 目录**（`/home/ubuntu/adbwallet`）建议权限 `0700`，包含 SSL 证书。
 
 ---
 
@@ -171,28 +151,38 @@ print("当前活跃:", get_active()["alias"])
 3. **日志脱敏**：查询日志和错误信息可能包含 SQL 片段，避免在公开渠道分享。
 4. **多租户注意**：若多人共用网关，每个人应使用独立的 `accountId` 隔离连接配置。
 5. **connections.json 可删除**：升级完成后，若确认所有连接都迁移到了 `openclaw.json`，可删除 `memory/connections.json`，`connection_manager` 会自动回退到纯 env var 模式。
+6. **v2.0 去除了 Java 依赖**：不再需要 JDK/JRE、JDBC JAR 文件，安装配置大幅简化。
 
 ---
 
 ## ✅ 安全进化轨迹对比
 
-| 检查项 | v1.0.0 | v1.0.1 (稳定安全) | v1.1 (全自动化) |
-|--------|--------|--------|--------|
-| `sudo apt-get install` 字体漏洞 | ❌ 存在 | ✅ 移除 | ✅ 移除无痕下载 |
-| 字体库渲染缺字/豆腐块现象 | ❌ 粗体渲染全盘崩溃 | ⚠️ 治标未固，仅下常规 | ✅ 完整获取双轨库 |
-| 飞书 API Token 固化隐患 | ❌ Token 裸奔外泄 | ❌ Token 裸奔外泄 | ✅ 脱绑改派 Markdown 大模型截获 |
-| 明文密码在磁盘 | ❌ connections.json | ✅ 仅存 openclaw.json env | ✅ 仅存 openclaw.json env |
-| Oracle Jar 配置风险及许可阻断 | ❌ 需人工穿越官网受限协议 | ❌ 需人工穿越官网受限协议 | ✅ Maven 公用通道自动拉取 21.21.0.0 验证 |
+| 检查项 | v1.0 | v2.0 (thin driver) |
+|--------|------|--------|
+| `sudo apt-get install` 字体漏洞 | ✅ 移除 | ✅ 移除无痕下载 |
+| 字体库渲染缺字/豆腐块现象 | ✅ 完整获取双轨库 | ✅ 完整获取双轨库 |
+| 明文密码在磁盘 | ✅ 仅存 openclaw.json env | ✅ 仅存 openclaw.json env |
+| Oracle JDBC JAR 下载/依赖 | ⚠️ 需 Maven 下载 JAR | ✅ 无 JAR，纯 Python |
+| MySQL JDBC JAR 下载/依赖 | ⚠️ 需 Maven 下载 JAR | ✅ 无 JAR，纯 Python |
+| Java/JDK 运行时依赖 | ❌ 必须安装 JDK >=18 | ✅ 无需 Java |
+| 总依赖大小 | ~30MB (JRE + JARs) | ~15MB (纯 Python) |
 
 ---
 
-## 📦 JDBC JAR 自动云获取装配架构 (v1.1 新款发布)
+## 🚀 v2.0 架构变更亮点
 
-得益于 v1.1 加入的强力 `install.py`，**我们已跨过了此前的许可隔离壁垒，真正实现了高阶依赖的自动托管**！
+1. **去掉 JPype1/JayDeBeApi/JDBC** — 全部改用 Python native thin driver
+2. **去掉 Java 检测/安装** — `install.py` 简化为纯 `pip install`
+3. **去掉 JDBC JAR 下载** — 不再需要 Maven 下载 `ojdbc11.jar` 等
+4. **兼容旧配置** — 仍然读取 `jdbc_url` 字段，自动解析为 thin driver 格式
+5. **安装更简单** — 只需 `pip install oracledb mysql-connector-python matplotlib`
 
-| JAR | 风险 | v1.1 的突破说明 |
-|-----|------|------|
-| Oracle 驱动 | 🟢 低 (隔离环境沙箱) | 无需再去 Oracle 官网忍受反人类许可协议，由脚本通过 Maven 映射源安全抓取包括 `ojdbc11-21.21.0.0.jar`, `oraclepki.jar`, `osdt_core.jar`, `osdt_cert.jar` 完整验证族簇链，自愈适配 TCPS / Wallet！ |
-| MySQL 驱动 | 🟢 低 | 通过官方源获取 `mysql-connector-j-8.0.33.jar`。 |
+---
 
-**安全操作**：Agent 或宿主在初始阶段敲击 `python install.py --auto-jdbc` 即可完成落盘。由于全过程使用基于 Python 内置的 `urllib` 请求机制拉取，且落标在项目自身的 `./lib`，**不存在任何针对全局宿主的渗透越权威胁**。
+## 📦 依赖清单 (v2.0)
+
+| 包 | 用途 | 协议 |
+|----|------|------|
+| `oracledb>=2.0.0` | Oracle 数据库连接（thin mode） | Apache 2.0 |
+| `mysql-connector-python>=8.0.0` | MySQL 数据库连接 | GPL 2.0 |
+| `matplotlib>=3.7.0` | 图表生成 | PSF |

@@ -1,21 +1,22 @@
 ---
 name: db-query
-version: 1.1.0
-description: Query Oracle and MySQL databases via JDBC thin driver using natural language. Supports chart generation (bar, pie, line) with native Markdown image delivery. Designed for large schemas (100+ tables) with token-optimized fuzzy matching and schema caching.
+version: 2.0.0
+description: Query Oracle and MySQL databases via Python thin drivers using natural language. Supports chart generation (bar, pie, line) with native Markdown image delivery. Designed for large schemas (100+ tables) with token-optimized fuzzy matching and schema caching.
 ---
 
-# db-query (v1.1)
+# db-query (v2.0)
 
 > **READ-ONLY 数据库查询技能** — 仅支持 SELECT/SHOW/DESCRIBE/EXPLAIN
-> 支持 Oracle (TCPS/Wallet) 和 MySQL，支持多数据库连接管理和 Schema 缓存。
+> 支持 Oracle 和 MySQL，支持多数据库连接管理和 Schema 缓存。
 >
-> **安全设计与交互式配置 (v1.1)**：所有凭据存储在 `openclaw.json` 的 `skills.env` 中（不上磁盘）。新增了 `install.py` 引导程序完成环境全自动无痛沙盒安装。
+> **v2.0 改用 Python thin driver**：使用 `oracledb`（Oracle）和 `mysql-connector-python`（MySQL），**无需 Java/JDK/JDBC JAR**。
+> 兼容原有的 `jdbc_url` 配置字段，自动解析为 thin driver 格式。
 
 ---
 
 ## 核心功能
 
-1. **自然语言 → SQL 查询**（JDBC Thin Driver）
+1. **自然语言 → SQL 查询**（Python thin driver）
 2. **图表生成**（直方图 / 饼图 / 折线图，基于 Markdown 的动态原窗渲染）
 3. **多数据库连接管理**（Oracle + MySQL，支持多连接切换）
 4. **Schema 缓存**（DDL + Comment，写入 memory/，避免重复扫描）
@@ -26,19 +27,17 @@ description: Query Oracle and MySQL databases via JDBC thin driver using natural
 
 ```
 skills/db-query/
-  install.py                  ← [NEW] 安装向导程序
+  install.py                  ← 安装向导程序（pip 依赖安装）
   SKILL.md                    ← 本文件
   SECURITY.md                 ← 安全设计文档（必读）
   scripts/
-    db_query.py               ← 统一个各种数据库引擎的查询入口
+    db_query.py               ← 统一个各种数据库引擎的查询入口（thin driver）
     chart_utils.py            ← 图表生成引擎 (渲染本地图片供 Agent 提取)
     connection_manager.py     ← 连接管理（纯 env var 模式）
-    schema_discovery.py        ← Schema 抓取
+    schema_discovery.py       ← Schema 抓取（thin driver）
   memory/
     connections.json          ← 仅作 legacy fallback（不含密码）
     schema_<alias>.md         ← Schema 缓存
-  lib/                        ← JDBC JAR存放目录
-    ojdbc11.jar / mysql-connector-java.jar 等等
 ```
 
 ---
@@ -47,18 +46,32 @@ skills/db-query/
 
 **所有连接配置统一放在 `openclaw.json` 的 `skills.env` 中。`connections.json` 仅为旧版兼容 fallback，不存任何凭据。**
 
+`jdbc_url` 字段支持两种格式，thin driver 会自动解析：
+
+- **Oracle**: `jdbc:oracle:thin:@host:port/service` → 自动截取 `host:port/service` 作为 DSN
+- **MySQL**: `jdbc:mysql://host:port/database` → 自动截取并解析 host/port/database
+
 ### 添加新连接
 
 ```python
 from connection_manager import add_connection
 
+# Oracle
 add_connection(
     alias="生产库",
     db_type="oracle",
     user="wksp_xuxin",
     password="Jessica820608",
-    jdbc_url="jdbc:oracle:thin:@(description=(address=(protocol=tcps)(port=1522)...",
-    wallet_path="/home/ubuntu/adbwallet",
+    jdbc_url="jdbc:oracle:thin:@60.205.104.42:358/freepdb1",
+)
+
+# MySQL
+add_connection(
+    alias="测试库",
+    db_type="mysql",
+    user="root",
+    password="dev123",
+    jdbc_url="jdbc:mysql://localhost:3306/test",
 )
 ```
 
@@ -68,7 +81,7 @@ add_connection(
 {
   "skills": {
     "env": {
-      "CONN____": "{\"db_type\":\"oracle\",\"user\":\"wksp_xuxin\",\"password\":\"Jessica820608\",\"jdbc_url\":\"jdbc:oracle:thin:@(description=...)\",\"wallet_path\":\"/home/ubuntu/adbwallet\"}"
+      "CONN____": "{\"db_type\":\"oracle\",\"user\":\"wksp_xuxin\",\"password\":\"Jessica820608\",\"jdbc_url\":\"jdbc:oracle:thin:@60.205.104.42:358/freepdb1\"}"
     }
   }
 }
@@ -80,9 +93,9 @@ add_connection(
 {
   "skills": {
     "env": {
-      "CONN_PROD_ORACLE": "{\"db_type\":\"oracle\",\"user\":\"wksp_xuxin\",\"password\":\"xxx\",\"jdbc_url\":\"jdbc:oracle:thin:@(description=...)\",\"wallet_path\":\"/home/ubuntu/adbwallet\"}",
+      "CONN_PROD_ORACLE": "{\"db_type\":\"oracle\",\"user\":\"jaenergy\",\"password\":\"JAenergy2026\",\"jdbc_url\":\"jdbc:oracle:thin:@60.205.104.42:358/freepdb1\"}",
       "CONN_DEV_MYSQL": "{\"db_type\":\"mysql\",\"user\":\"root\",\"password\":\"dev123\",\"jdbc_url\":\"jdbc:mysql://localhost:3306/test\"}",
-      "CONN_REPORT_ORACLE": "{\"db_type\":\"oracle\",\"user\":\"rpt_user\",\"password\":\"xxx\",\"jdbc_url\":\"jdbc:oracle:thin:@...\",\"wallet_path\":\"/home/ubuntu/adbwallet\"}"
+      "CONN_REPORT_ORACLE": "{\"db_type\":\"oracle\",\"user\":\"rpt_user\",\"password\":\"xxx\",\"jdbc_url\":\"jdbc:oracle:thin:@host:1521/service\"}"
     }
   }
 }
@@ -158,7 +171,7 @@ discover_mysql(get_active())    # 写入 memory/schema_<alias>.md
 
 **Step 1（零连接强制询问）：检查配置**
 - 在执行任何查询之前，必须先调用 `connection_manager.list_connections()` 探测系统中存在的数据库连接环境。
-- 如果返回为空 (0 个连接)：立刻停止任何解析，原生回复用户：“抱歉，因为系统中尚未配置任何数据库连接信息，我无法为您查询。请您告诉我您的数据库连接详情，包含：1. 数据库类型(oracle 或 mysql) 2. 连接地址(JDBC URL 或 主机/端口) 3. 登录用户名 4. 登录密码。如果您使用的是需要 Wallet 鉴权的 Oracle TCPS 数据库，还需要告诉我 Wallet 的绝对路径。” 待用户提供完整后，你再根据提供的内容调用 `add_connection` 或组装设置。
+- 如果返回为空 (0 个连接)：立刻停止任何解析，原生回复用户："抱歉，因为系统中尚未配置任何数据库连接信息，我无法为您查询。请您告诉我您的数据库连接详情，包含：1. 数据库类型(oracle 或 mysql) 2. 连接地址(JDBC URL 或 主机/端口) 3. 登录用户名 4. 登录密码。" 待用户提供完整后，你再根据提供的内容调用 `add_connection` 或组装设置。
 
 **Step 2（多源库会话锁定）：多连接提示**
 - 每次一个新的用户查询意图出现时（代表一个新的对话），如果你通过 `list_connections()` 发现存在**超过 1 个**的数据库连接 alias，并且用户并未在要求中明确说明用哪个库。
@@ -208,6 +221,62 @@ render_bar_chart(
 
 ---
 
+---
+
+## 🖼️ 飞书图片直发功能
+
+当 OpenClaw 通过 Feishu 渠道运行时，图表渲染后可直接通过飞书 Open API 发送到聊天窗口，**无需 sharp/Node.js 依赖**。
+
+### 使用方法
+
+```python
+from feishu_uploader import FeishuUploader
+
+uploader = FeishuUploader()  # 自动从 openclaw.json 读取 appId/appSecret
+
+# 上传图片
+image_key = uploader.upload("/path/to/chart.png")
+
+# 回复消息
+uploader.reply_with_image("om_xxxxxxxx", image_key)
+
+# 发送到会话
+uploader.send_image_to_chat("oc_xxxxxxxx", image_key)
+
+# 一步到位：上传并发送
+uploader.upload_and_send("chart.png", "om_xxxxxxxx", is_message_id=True)
+
+# 批量：多图一次发
+uploader.upload_batch(["chart1.png", "chart2.png"], "om_xxxxxxxx", is_message_id=True)
+```
+
+### 与图表配合使用
+
+```python
+from chart_utils import render_bar_chart, send_charts_to_feishu
+
+# 1. 生成图表
+trend_path = render_line_chart(labels, values, title="趋势图", output_path="trend.png")
+
+# 2. 发到飞书（reply 当前消息）
+send_charts_to_feishu([trend_path], target="om_xxxxxxxx", is_message_id=True)
+```
+
+### 凭据来源（优先级）
+
+1. 构造时传入：`FeishuUploader(app_id="xxx", app_secret="xxx")`
+2. 环境变量：`FEISHU_APP_ID` + `FEISHU_APP_SECRET`
+3. `openclaw.json` 中的 `channels.feishu.appId` / `appSecret`
+
+### CLI 使用
+
+```bash
+python scripts/feishu_uploader.py chart.png --reply om_xxxxxxxx
+python scripts/feishu_uploader.py chart1.png chart2.png --to-chat oc_xxxxxxxx
+```
+
+---
+
 ## 安全规则
 
 | 规则 | 说明 |
@@ -218,65 +287,31 @@ render_bar_chart(
 | 深分页拒绝 | 禁止 `OFFSET N`（N>1000） |
 | 密码不落地 | 全部存在 `openclaw.json` env，运行时读入内存 |
 | 无 sudo 字体 | 字体下载到 `~/.local/share/fonts/` |
+| 无 Java 依赖 | 纯 Python thin driver，无需 JDK/JRE/JDBC JAR |
 
 ---
 
-## 迁移指南（从 v1.0.0 升级）
-
-### 1. 导出旧连接
-
-```python
-from connection_manager import list_connections
-print(list_connections())
-```
-
-### 2. 重新添加（通过 openclaw.json）
-
-对每个旧连接运行：
-
-```python
-from connection_manager import add_connection
-add_connection(alias="生产库", db_type="oracle", user="wksp_xuxin",
-               password="Jessica820608",
-               jdbc_url="jdbc:oracle:thin:@(description=...)",
-               wallet_path="/home/ubuntu/adbwallet")
-# 复制输出的 JSON 到 openclaw.json
-```
-
-### 3. 重启网关
+## 安装依赖
 
 ```bash
-openclaw gateway restart
+# 进入 db-query 目录
+cd ~/.openclaw/skills-ins/db-query
+
+# 安装 Python 依赖（oracledb + mysql-connector-python + matplotlib）
+pip install -r requirements.txt
+
+# 或使用安装脚本
+python install.py --auto-pip
 ```
 
-### 4. 验证
-
-```python
-from connection_manager import diagnose, get_active
-print(diagnose())
-print(get_active()["alias"])
-```
-
----
-
----
-
-## 📦 新版本特性：环境快速安装导览 (v1.1 新增)
-
-直接在 `db-query` 的根目录下执行：
-```bash
-python install.py
-```
-这将会启动交互式的向导，它可以：
-1. **自动为您检测 Java 版本**，如果不满足要求，它将在用户安全隔离沙箱内自动安装。对于 Mac，采用轻量安全的 `pip install install-jdk` 无感化下载。对于 Linux 则会自动尝试包管理器 `apt-get` 等等，绝不侵染原有内核。
-2. **自动探测和下载所需 JDBC Jar 依赖** 且存放在本目录内的 `lib/` 夹下。告别过去复杂的下载链接。
+**注意**：v2.0 不再需要 Java/JDK/JRE/JDBC JAR 文件。原有的 `lib/` 目录中的 JAR 文件可以安全删除。
 
 ---
 
 ## 当前已配置
 
-- **生产库** (Oracle ADB, TCPS)
+- **生产库** (Oracle)
   - Env Key: `CONN____`
-  - 用户: `wksp_xuxin`
+  - 用户: `jaenergy`
   - Schema 已缓存: `memory/schema_生产库.md`
-  - JAR 驱动: `lib/`（需手动安装，见上方说明）
+  - 驱动: oracledb thin driver（无 JAR 依赖）
