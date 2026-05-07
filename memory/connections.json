@@ -1,16 +1,1 @@
-{
-  "connections": [
-    {
-      "alias": "报表库",
-      "db_type": "oracle",
-      "user": "jaenergy",
-      "password": "JAenergy2026",
-      "host": "60.205.104.42",
-      "port": 358,
-      "database": "freepdb1",
-      "wallet_path": null,
-      "last_used": "2026-05-07T14:42:14.804347"
-    }
-  ],
-  "active": "报表库"
-}
+
