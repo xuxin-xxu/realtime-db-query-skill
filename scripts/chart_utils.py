@@ -125,6 +125,17 @@ _font_bold_prop = fm.FontProperties(fname=_cjk_font.replace("Regular","Bold")) i
 
 plt.rcParams['axes.unicode_minus'] = False
 
+# 全局注册 CJK 字体，使得原生 matplotlib 代码也能自动支持中文，无需特别指定 fontproperties
+if _cjk_font:
+    try:
+        fm.fontManager.addfont(_cjk_font)
+        _font_name = fm.FontProperties(fname=_cjk_font).get_name()
+        plt.rcParams['font.sans-serif'] = [_font_name] + plt.rcParams['font.sans-serif']
+        plt.rcParams['font.family'] = 'sans-serif'
+    except Exception as e:
+        print(f"⚠️ 无法全局注册 CJK 字体: {e}", file=sys.stderr)
+
+
 
 def _py_str(val):
     """Coerce a Java String (or any non-str) to Python str."""
